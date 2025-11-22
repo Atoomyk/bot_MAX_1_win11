@@ -21,7 +21,8 @@ from maxapi.types import (
 from maxapi.utils.inline_keyboard import AttachmentType
 
 # Импорт системы логирования
-from logging_config import setup_logging, log_user_event, log_system_event, log_data_event, log_security_event, log_transport_event
+from logging_config import setup_logging, log_user_event, log_system_event, log_data_event, log_security_event, \
+    log_transport_event
 
 # Настройка логирования
 setup_logging()
@@ -40,11 +41,11 @@ MAX_API_BASE_URL = "https://platform-api.max.ru"
 HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
-    "Authorization": f"Bearer {TOKEN}"
+    "Authorization": f"{TOKEN}"
 }
 
 
-async def get_webhook_subscriptions():
+async def get_webhook_subscriptions(silent=False):
     """Получить список всех вебхук-подписок"""
     try:
         async with aiohttp.ClientSession() as session:
@@ -54,71 +55,39 @@ async def get_webhook_subscriptions():
             ) as response:
                 if response.status == 200:
                     data = await response.json()
-                    log_system_event("webhook", "subscriptions_retrieved", count=len(data.get('subscriptions', [])))
-                    return data.get('subscriptions', [])
+                    subscriptions = data.get('subscriptions', [])
+
+                    # ВЫВОД В КОНСОЛЬ ТОЛЬКО ЕСЛИ НЕ SILENT MODE
+                    if not silent:
+                        print(f"\n=== ТЕКУЩИЕ ВЕБХУКИ ===")
+                        print(f"Найдено подписок: {len(subscriptions)}")
+
+                        for i, sub in enumerate(subscriptions, 1):
+                            print(f"{i}. URL: {sub.get('url', 'N/A')}")
+                            print(f"   Время: {sub.get('time', 'N/A')}")
+                            print(f"   Типы: {', '.join(sub.get('update_types', []))}")
+                            print()
+
+                    return subscriptions
                 else:
-                    log_transport_event("GET", "/subscriptions", "error", status=response.status)
+                    if not silent:
+                        print(f"❌ Ошибка получения вебхуков: {response.status}")
                     return []
     except Exception as e:
-        log_transport_event("GET", "/subscriptions", "exception", error=str(e))
+        if not silent:
+            print(f"❌ Ошибка при запросе вебхуков: {str(e)}")
         return []
 
 
-async def delete_webhook_subscription(url):
-    """Удалить конкретную вебхук-подписку"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.delete(
-                    f"{MAX_API_BASE_URL}/subscriptions",
-                    headers=HEADERS,
-                    json={"url": url}
-            ) as response:
-                if response.status == 200:
-                    log_system_event("webhook", "subscription_deleted", url=url)
-                    return True
-                else:
-                    log_transport_event("DELETE", "/subscriptions", "error", status=response.status, url=url)
-                    return False
-    except Exception as e:
-        log_transport_event("DELETE", "/subscriptions", "exception", error=str(e), url=url)
-        return False
-
-
-async def delete_all_webhook_subscriptions():
-    """Удалить все вебхук-подписки"""
-    log_system_event("webhook", "cleanup_started")
-
-    # 1. Получаем список всех подписок
-    subscriptions = await get_webhook_subscriptions()
-
-    if not subscriptions:
-        log_system_event("webhook", "no_subscriptions_found")
-        return True
-
-    log_system_event("webhook", "subscriptions_found", count=len(subscriptions))
-
-    # 2. Удаляем каждую подписку
-    success_count = 0
-    for subscription in subscriptions:
-        url = subscription.get('url')
-        if url:
-            success = await delete_webhook_subscription(url)
-            if success:
-                success_count += 1
-            # Небольшая задержка между запросами
-            await asyncio.sleep(0.5)
-
-    log_system_event("webhook", "cleanup_completed", deleted=f"{success_count}/{len(subscriptions)}")
-    return success_count == len(subscriptions)
-
-
 async def setup_webhook():
-    """Настраивает вебхук через Xtunnel после очистки старых"""
-    # Сначала удаляем все старые вебхуки
-    await delete_all_webhook_subscriptions()
+    """Настраивает вебхук через Xtunnel"""
+    print("🔄 Настройка вебхука...")
 
-    # Затем настраиваем новый вебхук
-    log_system_event("webhook", "setup_started", url=X_TUNNEL_URL)
+    # Получаем и выводим текущие вебхуки (ПЕРВЫЙ РАЗ - ПОКАЗЫВАЕМ)
+    current_subscriptions = await get_webhook_subscriptions(silent=False)
+
+    # Настраиваем новый вебхук
+    print(f"🔄 Устанавливаю новый вебхук: {X_TUNNEL_URL}")
     await bot.subscribe_webhook(
         url=X_TUNNEL_URL,
         update_types=[
@@ -127,7 +96,13 @@ async def setup_webhook():
             "bot_started"
         ]
     )
-    log_system_event("webhook", "setup_completed")
+
+    # Проверяем результат (ВТОРОЙ РАЗ - НЕ ПОКАЗЫВАЕМ)
+    final_subscriptions = await get_webhook_subscriptions(silent=True)
+    if final_subscriptions:
+        print("✅ Вебхук успешно настроен!")
+    else:
+        print("❌ Ошибка настройки вебхука")
 
 
 SOGL_LINK = "https://sevmiac.ru/upload/iblock/d73/sttjnvlhg3j2df943ve0fv3husrlm8oj.pdf"
@@ -151,7 +126,7 @@ GOSUSLUGI_MEDICAL_EXAM_URL = "https://www.gosuslugi.ru/647521/1/form"
 GOSUSLUGI_DOCTOR_HOME_URL = "https://www.gosuslugi.ru/600361"
 GOSUSLUGI_ATTACH_TO_POLYCLINIC_URL = "https://www.gosuslugi.ru/600360"
 CONTACT_CENTER_URL = "https://sevmiac.ru/ekc/"
-MAP_OF_MEDICAL_INSTITUTIONS_URL = "https://yandex.ru/maps/959/sevastopol/search/%D0%B1%D0%BE%D0%BB%D1%8C%D0%BD%D0%B8%D1%86%D1%8B%20%D1%81%D0%B5%D0%B2%D0%B0%D1%81%D1%82%D0%BE%D0%BF%D0%BE%D0%BB%D1%8C/?ll=33.542596%2C44.577279&profile-mode=1&sctx=ZAAAAAgCEAAaKAoSCc0iFFtBJUNAEfYM4ZhlAUtAEhIJPgXAeAYN1z8RHCjwTj49wj8iBgABAgQFBigEOABAvwdIAWIaYWRkX3NuaXBwZXQ9bWV0YXJlYWx0eS8xLnhiHGFkZF9zbmlwcGV0PW1haW5fYXNwZWN0cy8xLnhiKXJlYXJyPXNjaGVtZV9Mb2NhbC9HZW8vTWV0YVJlYWx0eUtwcz0xMDAyagJydZUBAAAAAJ0BzczMPaABAagBAL0B09dLsMIBhwGI0oWYBI%2BevdYEmM%2BXmoAChf6Czky%2F3bm7BMGrr6oE1Oz6ngT91qOQtQK8ib%2FOiAXoteKRBMXVwJYEgcLQhgaczPbLBriO%2FskE1uOJgtoFkJjwtQaD48Tekgeq8ezXBq%2FLm%2BDCBMfokZuaA8nSo%2FkEiuHzlv8GktWn1IYB7bCdwuQF04y6xTmCAifQsdC%2B0LvRjNC90LjRhtGLINGB0LXQstCw0YHRgtC%2B0L%2FQvtC70YyKAiwxODQxMDU5NTYkMTg0MTA1OTU4JDUzNDM3MjYwNTU5JDE5ODM5NTI4OTU0MpICAzk1OZoCDGRlc2t0b3AtbWFwc6oCDDE2NTc0MjkxODkzOQ%3D%3D&sll=33.542596%2C44.577279&source=wizbiz_new_map_multi&sspn=0.240326%2C0.097050&z=13"
+MAP_OF_MEDICAL_INSTITUTIONS_URL = "https://yandex.ru/maps/959/sevastopol/search/%D0%B1%D0%BE%D0%BB%D1%8C%D0%BD%D0%B8%D1%86%D1%8B%20%D1%81%D0%B5%D0%B2%D0%B0%D1%81%D1%82%D0%BE%D0%BF%D0%BE%D0%BB%D1%8C/?ll=33.542596%2C44.577279&profile-mode=1&sctx=ZAAAAAgCEAAaKAoSCc0iFFtBJUNAEfYM4ZhlAUtAEhIJPgXAeAYN1z8RHCjwTj49wj8iBgABAgQFBigEOABAvwdIAWIaYWRkX3NuaXBwZXQ9bWV0YXJlYWx0eS8xLnhiHGFkZF9zbmlwcGV0=PW1haW5fYXNwZWN0cy8xLnhiKXJlYXJyPXNjaGVtZV9Mb2NhbC9HZW8vTWV0YVJlYWx0eUtwcz0xMDAyagJydZUBAAAAAJ0BzczMPaABAagBAL0B09dLsMIBhwGI0oWYBI%2BevdYEmM%2BXmoAChf6Czky%2F3bm7BMGrr6oE1Oz6ngT91qOQtQK8ib%2FOiAXoteKRBMXVwJYEgcLQhgaczPbLBriO%2FskE1uOJgtoFkJjwtQaD48Tekgeq8ezXBq%2FLm%2BDCBMfokZuaA8nSo%2FkEiuHzlv8GktWn1IYB7bCdwuQF04y6xTmCAifQsdC%2B0LvRjNC90LjRhtGLINGB0LXQstCw0YHRgtC%2B0L%2FQvtC70YyKAiwxODQxMDU5NTYkMTg0MTA1OTU4JDUzNDM3MjYwNTU5JDE5ODM5NTI4OTU0MpICAzk1OZoCDGRlc2t0b3AtbWFwc6oCDDE2NTc0MjkxODkzOQ%3D%3D&sll=33.542596%2C44.577279&source=wizbiz_new_map_multi&sspn=0.240326%2C0.097050&z=13"
 
 # Импорт базы данных из отдельного файла
 from user_database import db
@@ -779,7 +754,7 @@ async def main():
     # Логирование запуска бота
     log_system_event("bot", "starting")
 
-    # Сначала настраиваем вебхук (включая очистку старых)
+    # Настраиваем вебхук
     await setup_webhook()
 
     # Затем запускаем сервер
@@ -790,6 +765,7 @@ async def main():
         port=80,
         log_level='info'
     )
+
 
 if __name__ == "__main__":
     try:
