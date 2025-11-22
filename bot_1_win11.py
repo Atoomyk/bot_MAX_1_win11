@@ -522,7 +522,7 @@ async def message_callback(event: MessageCallback):
         await request_birth_date_correction(event.bot, chat_id, current_data)
 
     elif payload == CONFIRM_DATA_CALLBACK:
-        log_user_event(chat_id_str, "data_confirmation_requested")
+        log_user_event(chat_id_str, "user confirmed the registration")
         # Завершаем регистрацию
         user_data = user_states.get(chat_id_str, {}).get('data', {})
 
