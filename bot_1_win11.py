@@ -1,10 +1,8 @@
 import asyncio
-import logging
 import os
 import time
 import re
 import aiohttp
-import json
 from functools import wraps
 from dotenv import load_dotenv
 
@@ -22,8 +20,7 @@ from maxapi.types import (
 from maxapi.utils.inline_keyboard import AttachmentType
 
 # Импорт системы логирования
-from logging_config import setup_logging, log_user_event, log_system_event, log_data_event, log_security_event, \
-    log_transport_event
+from logging_config import setup_logging, log_user_event, log_system_event, log_data_event, log_security_event
 
 # Настройка логирования
 setup_logging()
@@ -32,7 +29,7 @@ setup_logging()
 load_dotenv()
 TOKEN = os.getenv("MAXAPI_TOKEN")
 
-X_TUNNEL_URL = "https://0a430bc8-6c9e-491d-b543-48003d4177ef.tunnel4.com"
+X_TUNNEL_URL = "https://f82873f0-8dfc-4105-bb8e-8ed3693c9824.tunnel4.com"
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -112,6 +109,17 @@ def anti_duplicate(rate_limit=1.0):
 
     return decorator
 
+def cleanup_processed_events():
+    """Очистка старых записей для экономии памяти"""
+    global processed_events
+    current_time = time.time()
+    # Удаляем записи старше 1 часа
+    expired_chats = [
+        chat_id for chat_id, data in processed_events.items()
+        if current_time - data.get('last_time', 0) > 3600
+    ]
+    for chat_id in expired_chats:
+        del processed_events[chat_id]
 
 def create_keyboard(buttons_config):
     """Универсальная функция создания клавиатуры"""
@@ -385,7 +393,17 @@ async def complete_registration(bot_instance: Bot, chat_id: int, user_data: dict
     birth_date = user_data['birth_date']
     phone = user_data['phone']
 
-    success = db.register_user(str(chat_id), fio, phone, birth_date)
+    try:
+        # Добавить таймаут на операцию с БД
+        async with asyncio.timeout(10):
+            success = db.register_user(str(chat_id), fio, phone, birth_date)
+    except asyncio.TimeoutError:
+        log_system_event("db_timeout", chat_id=str(chat_id))
+        await bot_instance.send_message(
+            chat_id=chat_id,
+            text="⏳ Сервер перегружен, попробуйте позже"
+        )
+        return
 
     if success:
         user_states.pop(str(chat_id), None)
@@ -441,35 +459,45 @@ async def bot_started(event: BotStarted):
 @anti_duplicate()
 async def message_callback(event: MessageCallback):
     """Обработка нажатий на инлайн-кнопки"""
-    chat_id = event.message.recipient.chat_id
-    chat_id_str = str(chat_id)
-    payload = event.callback.payload
+    try:
+        # Очистка старых событий при достижении лимита
+        if len(processed_events) > 1000:
+            cleanup_processed_events()
 
-    log_user_event(chat_id_str, "button_pressed", payload=payload)
+        chat_id = event.message.recipient.chat_id
+        chat_id_str = str(chat_id)
+        payload = event.callback.payload
 
-    # Обработка разных callback-ов
-    if payload == CONTINUE_CALLBACK:
-        await send_agreement_message(event.bot, chat_id)
+        log_user_event(chat_id_str, "button_pressed", payload=payload)
 
-    elif payload == AGREEMENT_CALLBACK:
-        log_security_event(chat_id_str, "consent_accepted")
-        await start_registration_process(event.bot, chat_id)
+        # Обработка разных callback-ов
+        if payload == CONTINUE_CALLBACK:
+            await send_agreement_message(event.bot, chat_id)
 
-    elif payload == CONFIRM_PHONE_CALLBACK:
-        await handle_phone_confirmation(event, chat_id_str, chat_id)
+        elif payload == AGREEMENT_CALLBACK:
+            log_security_event(chat_id_str, "consent_accepted")
+            await start_registration_process(event.bot, chat_id)
 
-    elif payload == REJECT_PHONE_CALLBACK:
-        log_user_event(chat_id_str, "phone_rejected")
-        await handle_incorrect_phone(event.bot, chat_id)
+        elif payload == CONFIRM_PHONE_CALLBACK:
+            await handle_phone_confirmation(event, chat_id_str, chat_id)
 
-    elif payload == CORRECT_FIO_CALLBACK:
-        await handle_data_correction(event, chat_id_str, chat_id, 'fio')
+        elif payload == REJECT_PHONE_CALLBACK:
+            log_user_event(chat_id_str, "phone_rejected")
+            await handle_incorrect_phone(event.bot, chat_id)
 
-    elif payload == CORRECT_BIRTH_DATE_CALLBACK:
-        await handle_data_correction(event, chat_id_str, chat_id, 'birth_date')
+        elif payload == CORRECT_FIO_CALLBACK:
+            await handle_data_correction(event, chat_id_str, chat_id, 'fio')
 
-    elif payload == CONFIRM_DATA_CALLBACK:
-        await handle_data_confirmation(event, chat_id_str, chat_id)
+        elif payload == CORRECT_BIRTH_DATE_CALLBACK:
+            await handle_data_correction(event, chat_id_str, chat_id, 'birth_date')
+
+        elif payload == CONFIRM_DATA_CALLBACK:
+            await handle_data_confirmation(event, chat_id_str, chat_id)
+
+    except Exception as e:
+        log_system_event("callback_error", str(e), chat_id=chat_id_str)
+        # Удаляем состояние при ошибке
+        user_states.pop(chat_id_str, None)
 
 
 async def handle_phone_confirmation(event, chat_id_str, chat_id):
@@ -513,70 +541,73 @@ async def handle_data_confirmation(event, chat_id_str, chat_id):
 @anti_duplicate()
 async def handle_message(event: MessageCreated):
     """Обработка всех текстовых сообщений"""
-    chat_id = event.message.recipient.chat_id
-    chat_id_str = str(chat_id)
+    try:
+        # Очистка старых событий при достижении лимита
+        if len(processed_events) > 1000:
+            cleanup_processed_events()
 
-    # Проверяем базовые условия
-    if not event.message.body or not event.message.body.text:
-        if event.message.body and event.message.body.attachments:
-            await handle_contact_message(event)
-        return
+        chat_id = event.message.recipient.chat_id
+        chat_id_str = str(chat_id)
 
-    if not event.message.sender:
-        return
+        # Проверяем базовые условия
+        if not event.message.body or not event.message.body.text:
+            if event.message.body and event.message.body.attachments:
+                await handle_contact_message(event)
+            return
 
-    message_text = event.message.body.text.strip()
-    if not message_text:
-        return
+        if not event.message.sender:
+            return
 
-    log_user_event(chat_id_str, "message_sent", text=message_text)
+        message_text = event.message.body.text.strip()
+        if not message_text:
+            return
 
-    # Если пользователь не зарегистрирован и не в процессе регистрации, игнорируем
-    if not db.is_user_registered(chat_id_str) and chat_id_str not in user_states:
-        log_user_event(chat_id_str, "message_ignored_unregistered")
-        return
+        log_user_event(chat_id_str, "message_sent", text=message_text)
 
-    state_info = user_states.get(chat_id_str)
-    if not state_info:
-        if db.is_user_registered(chat_id_str):
-            greeting_name = db.get_user_greeting(chat_id_str)
-            await event.bot.send_message(chat_id=chat_id, text="✅ Вы уже в системе.")
-            await send_main_menu(event.bot, chat_id, greeting_name)
-        return
+        # Если пользователь не зарегистрирован и не в процессе регистрации, игнорируем
+        if not db.is_user_registered(chat_id_str) and chat_id_str not in user_states:
+            log_user_event(chat_id_str, "message_ignored_unregistered")
+            return
 
-    state = state_info.get('state')
-    user_data = state_info.get('data', {})
+        state_info = user_states.get(chat_id_str)
+        if not state_info:
+            if db.is_user_registered(chat_id_str):
+                greeting_name = db.get_user_greeting(chat_id_str)
+                await event.bot.send_message(chat_id=chat_id, text="✅ Вы уже в системе.")
+                await send_main_menu(event.bot, chat_id, greeting_name)
+            return
 
-    # Обработка разных состояний
-    state_handlers = {
-        'waiting_fio': lambda: validate_and_process_input(
-            chat_id_str, message_text, 'fio', event.bot, chat_id, user_data, request_birth_date
-        ),
-        'waiting_birth_date': lambda: validate_and_process_input(
-            chat_id_str, message_text, 'birth_date', event.bot, chat_id, user_data,
-            lambda bot, cid, data: user_states.update(
-                {chat_id_str: {'state': 'waiting_confirmation', 'data': data}}) or send_confirmation_message(bot, cid,
-                                                                                                             data)
-        ),
-        'waiting_fio_correction': lambda: validate_and_process_input(
-            chat_id_str, message_text, 'fio', event.bot, chat_id, user_data,
-            lambda bot, cid, data: user_states.update(
-                {chat_id_str: {'state': 'waiting_confirmation', 'data': data}}) or send_confirmation_message(bot, cid,
-                                                                                                             data)
-        ),
-        'waiting_birth_date_correction': lambda: validate_and_process_input(
-            chat_id_str, message_text, 'birth_date', event.bot, chat_id, user_data,
-            lambda bot, cid, data: user_states.update(
-                {chat_id_str: {'state': 'waiting_confirmation', 'data': data}}) or send_confirmation_message(bot, cid,
-                                                                                                             data)
-        )
-    }
+        state = state_info.get('state')
+        user_data = state_info.get('data', {})
 
-    if state in state_handlers:
-        result = state_handlers[state]()
-        if asyncio.iscoroutine(result):
-            await result
+        # Обработка разных состояний
+        state_handlers = {
+            'waiting_fio': lambda: validate_and_process_input(
+                chat_id_str, message_text, 'fio', event.bot, chat_id, user_data, request_birth_date
+            ),
+            'waiting_birth_date': lambda: validate_and_process_input(
+                chat_id_str, message_text, 'birth_date', event.bot, chat_id, user_data,
+                lambda bot, cid, data: user_states.update({chat_id_str: {'state': 'waiting_confirmation', 'data': data}}) or send_confirmation_message(bot, cid, data)
+            ),
+            'waiting_fio_correction': lambda: validate_and_process_input(
+                chat_id_str, message_text, 'fio', event.bot, chat_id, user_data,
+                lambda bot, cid, data: user_states.update({chat_id_str: {'state': 'waiting_confirmation', 'data': data}}) or send_confirmation_message(bot, cid, data)
+            ),
+            'waiting_birth_date_correction': lambda: validate_and_process_input(
+                chat_id_str, message_text, 'birth_date', event.bot, chat_id, user_data,
+                lambda bot, cid, data: user_states.update({chat_id_str: {'state': 'waiting_confirmation', 'data': data}}) or send_confirmation_message(bot, cid, data)
+            )
+        }
 
+        if state in state_handlers:
+            result = state_handlers[state]()
+            if asyncio.iscoroutine(result):
+                await result
+
+    except Exception as e:
+        chat_id_str = str(event.message.recipient.chat_id) if hasattr(event, 'message') and hasattr(event.message, 'recipient') else 'unknown'
+        log_system_event("message_handler_error", str(e), chat_id=chat_id_str)
+        user_states.pop(chat_id_str, None)
 
 async def handle_contact_message(event: MessageCreated):
     """Обработка сообщений с контактами"""
