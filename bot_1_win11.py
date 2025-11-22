@@ -3,6 +3,8 @@ import logging
 import os
 import time
 import re
+import aiohttp
+import json
 from dotenv import load_dotenv
 
 from maxapi import Bot, Dispatcher
@@ -19,7 +21,7 @@ from maxapi.types import (
 from maxapi.utils.inline_keyboard import AttachmentType
 
 # Импорт системы логирования
-from logging_config import setup_logging, log_user_event, log_bot_event, log_error, log_warning
+from logging_config import setup_logging, log_user_event, log_system_event, log_data_event, log_security_event, log_transport_event
 
 # Настройка логирования
 setup_logging()
@@ -28,10 +30,105 @@ setup_logging()
 load_dotenv()
 TOKEN = os.getenv("MAXAPI_TOKEN")
 
-X_TUNNEL_URL = "https://8f37e2cd-f4c8-4785-a06e-59b8e4a06500.tunnel4.com"
+X_TUNNEL_URL = "https://0a430bc8-6c9e-491d-b543-48003d4177ef.tunnel4.com"
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
+
+# Константы API
+MAX_API_BASE_URL = "https://platform-api.max.ru"
+HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {TOKEN}"
+}
+
+
+async def get_webhook_subscriptions():
+    """Получить список всех вебхук-подписок"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                    f"{MAX_API_BASE_URL}/subscriptions",
+                    headers=HEADERS
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    log_system_event("webhook", "subscriptions_retrieved", count=len(data.get('subscriptions', [])))
+                    return data.get('subscriptions', [])
+                else:
+                    log_transport_event("GET", "/subscriptions", "error", status=response.status)
+                    return []
+    except Exception as e:
+        log_transport_event("GET", "/subscriptions", "exception", error=str(e))
+        return []
+
+
+async def delete_webhook_subscription(url):
+    """Удалить конкретную вебхук-подписку"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(
+                    f"{MAX_API_BASE_URL}/subscriptions",
+                    headers=HEADERS,
+                    json={"url": url}
+            ) as response:
+                if response.status == 200:
+                    log_system_event("webhook", "subscription_deleted", url=url)
+                    return True
+                else:
+                    log_transport_event("DELETE", "/subscriptions", "error", status=response.status, url=url)
+                    return False
+    except Exception as e:
+        log_transport_event("DELETE", "/subscriptions", "exception", error=str(e), url=url)
+        return False
+
+
+async def delete_all_webhook_subscriptions():
+    """Удалить все вебхук-подписки"""
+    log_system_event("webhook", "cleanup_started")
+
+    # 1. Получаем список всех подписок
+    subscriptions = await get_webhook_subscriptions()
+
+    if not subscriptions:
+        log_system_event("webhook", "no_subscriptions_found")
+        return True
+
+    log_system_event("webhook", "subscriptions_found", count=len(subscriptions))
+
+    # 2. Удаляем каждую подписку
+    success_count = 0
+    for subscription in subscriptions:
+        url = subscription.get('url')
+        if url:
+            success = await delete_webhook_subscription(url)
+            if success:
+                success_count += 1
+            # Небольшая задержка между запросами
+            await asyncio.sleep(0.5)
+
+    log_system_event("webhook", "cleanup_completed", deleted=f"{success_count}/{len(subscriptions)}")
+    return success_count == len(subscriptions)
+
+
+async def setup_webhook():
+    """Настраивает вебхук через Xtunnel после очистки старых"""
+    # Сначала удаляем все старые вебхуки
+    await delete_all_webhook_subscriptions()
+
+    # Затем настраиваем новый вебхук
+    log_system_event("webhook", "setup_started", url=X_TUNNEL_URL)
+    await bot.subscribe_webhook(
+        url=X_TUNNEL_URL,
+        update_types=[
+            "message_created",
+            "message_callback",
+            "bot_started"
+        ]
+    )
+    log_system_event("webhook", "setup_completed")
+
 
 SOGL_LINK = "https://sevmiac.ru/upload/iblock/d73/sttjnvlhg3j2df943ve0fv3husrlm8oj.pdf"
 CONTINUE_CALLBACK = "start_continue"
@@ -61,7 +158,6 @@ from user_database import db
 
 # Словари для хранения состояний и защиты от дублирования
 user_states = {}
-greeted_users = set()
 processed_messages = set()
 processed_callbacks = set()
 last_processed = {}
@@ -126,7 +222,7 @@ async def start_registration_process(bot_instance: Bot, chat_id: int):
     user_states[str(chat_id)] = {'state': 'waiting_phone_confirmation', 'data': {}}
 
     # Логирование начала регистрации
-    log_user_event(str(chat_id), "registration started - phone confirmation")
+    log_user_event(str(chat_id), "registration_started")
 
     # Сообщение о необходимости подтвердить номер
     await bot_instance.send_message(
@@ -182,7 +278,7 @@ async def send_phone_confirmation(bot_instance: Bot, chat_id: int, phone: str):
 
 async def handle_incorrect_phone(bot_instance: Bot, chat_id: int):
     """Обработка неверного номера телефона - запрашиваем контакт заново"""
-    log_user_event(str(chat_id), "phone rejected, requesting again")
+    log_user_event(str(chat_id), "phone_rejected")
 
     await bot_instance.send_message(
         chat_id=chat_id,
@@ -198,7 +294,7 @@ async def start_fio_request(bot_instance: Bot, chat_id: int, user_data: dict):
     user_states[str(chat_id)] = {'state': 'waiting_fio', 'data': user_data}
 
     # Логирование начала ввода ФИО
-    log_user_event(str(chat_id), "FIO input started", f"Phone in data: {user_data.get('phone')}")
+    log_user_event(str(chat_id), "fio_input_started")
 
     await bot_instance.send_message(
         chat_id=chat_id,
@@ -209,10 +305,10 @@ async def start_fio_request(bot_instance: Bot, chat_id: int, user_data: dict):
 
 
 async def request_fio_correction(bot_instance: Bot, chat_id: int, user_data: dict):
-    """Запрашивает ФИО для исправления (без сообщения о регистрации)"""
-    log_user_event(str(chat_id), "requested FIO correction")
+    """Запрашивает ФИО для исправления и возвращает к подтверждению"""
+    log_user_event(str(chat_id), "fio_correction_requested")
     # Сохраняем текущие данные (особенно телефон)
-    user_states[str(chat_id)] = {'state': 'waiting_fio', 'data': user_data}
+    user_states[str(chat_id)] = {'state': 'waiting_fio_correction', 'data': user_data}
 
     await bot_instance.send_message(
         chat_id=chat_id,
@@ -223,10 +319,10 @@ async def request_fio_correction(bot_instance: Bot, chat_id: int, user_data: dic
 
 
 async def request_birth_date_correction(bot_instance: Bot, chat_id: int, user_data: dict):
-    """Запрашивает дату рождения для исправления (без сообщения о регистрации)"""
-    log_user_event(str(chat_id), "requested birth date correction")
+    """Запрашивает дату рождения для исправления и возвращает к подтверждению"""
+    log_user_event(str(chat_id), "birth_date_correction_requested")
     # Сохраняем текущие данные (особенно телефон)
-    user_states[str(chat_id)] = {'state': 'waiting_birth_date', 'data': user_data}
+    user_states[str(chat_id)] = {'state': 'waiting_birth_date_correction', 'data': user_data}
 
     await bot_instance.send_message(
         chat_id=chat_id,
@@ -256,9 +352,8 @@ async def send_confirmation_message(bot_instance: Bot, chat_id: int, user_data: 
     birth_date = user_data.get('birth_date', 'Не указано')
     phone = user_data.get('phone', 'Не указано')
 
-    # Детальное логирование для отладки
-    log_user_event(str(chat_id), "DEBUG confirmation data", f"FIO: {fio}, Birth: {birth_date}, Phone: {phone}")
-    log_user_event(str(chat_id), "DEBUG user_data keys", f"{list(user_data.keys())}")
+    # Логирование данных для подтверждения
+    log_data_event(str(chat_id), "confirmation_prepared", fio=fio, birth_date=birth_date, phone=phone)
 
     # Создаем кнопки для исправления (без кнопки телефона)
     correct_fio_button = CallbackButton(
@@ -312,7 +407,7 @@ async def complete_registration(bot_instance: Bot, chat_id: int, user_data: dict
         greeting_name = db.get_user_greeting(str(chat_id))
 
         # Логирование успешной регистрации
-        log_user_event(str(chat_id), "registration completed successfully")
+        log_data_event(str(chat_id), "registration_completed", fio=fio, phone=phone, status="success")
 
         # Отправляем сообщение об успешной регистрации
         await bot_instance.send_message(
@@ -327,7 +422,7 @@ async def complete_registration(bot_instance: Bot, chat_id: int, user_data: dict
     else:
         # Ошибка при сохранении
         user_states.pop(str(chat_id), None)
-        log_error("Registration failed - duplicate user", f"User {chat_id}, FIO: {fio}, Phone: {phone}")
+        log_data_event(str(chat_id), "registration_failed", fio=fio, phone=phone, status="duplicate")
         await bot_instance.send_message(
             chat_id=chat_id,
             text=f"🚨 Ошибка при регистрации. Комбинация ФИО и телефона уже существует.\n\n"
@@ -343,15 +438,15 @@ async def bot_started(event: BotStarted):
     chat_id = event.chat_id
     chat_id_str = str(chat_id)
 
-    log_user_event(chat_id_str, "bot started")
+    log_user_event(chat_id_str, "bot_started")
 
     try:
         if db.is_user_registered(chat_id_str):
             greeting_name = db.get_user_greeting(chat_id_str)
-            log_user_event(chat_id_str, "already registered, showing main menu")
+            log_user_event(chat_id_str, "already_registered")
             await send_main_menu(event.bot, chat_id, greeting_name)
         else:
-            log_user_event(chat_id_str, "new user, starting registration")
+            log_user_event(chat_id_str, "new_user_detected")
             continue_button = CallbackButton(
                 text="Продолжить",
                 payload=CONTINUE_CALLBACK
@@ -375,8 +470,7 @@ async def bot_started(event: BotStarted):
                 attachments=[keyboard_attachment]
             )
     except Exception as e:
-        log_error("Failed to send welcome message", f"User {chat_id}: {str(e)}")
-        log_warning("Message sending failed", f"User {chat_id}")
+        log_system_event("bot_started", "message_send_failed", error=str(e), chat_id=chat_id_str)
 
 
 @dp.message_callback()
@@ -384,9 +478,6 @@ async def message_callback(event: MessageCallback):
     """Обработка нажатий на инлайн-кнопки"""
     chat_id = event.message.recipient.chat_id
     chat_id_str = str(chat_id)
-
-    # Логирование callback события
-    log_user_event(chat_id_str, "button pressed", f"Payload: {event.callback.payload}")
 
     # Защита от дублирования
     current_time = time.time()
@@ -403,24 +494,29 @@ async def message_callback(event: MessageCallback):
         if len(processed_callbacks) > 1000:
             processed_callbacks.clear()
 
-    if event.callback.payload == CONTINUE_CALLBACK:
-        log_user_event(chat_id_str, "continue button pressed")
+    payload = event.callback.payload
+
+    # Логирование callback события
+    log_user_event(chat_id_str, "button_pressed", payload=payload)
+
+    if payload == CONTINUE_CALLBACK:
+        log_system_event("callback_handler", "continue_processed", chat_id=chat_id_str)
         await send_agreement_message(event.bot, chat_id)
 
-    elif event.callback.payload == AGREEMENT_CALLBACK:
-        log_user_event(chat_id_str, "agreement accepted")
+    elif payload == AGREEMENT_CALLBACK:
+        log_security_event(chat_id_str, "consent_accepted")
         await start_registration_process(event.bot, chat_id)
 
     # Обработка подтверждения телефона
-    elif event.callback.payload == CONFIRM_PHONE_CALLBACK:
-        log_user_event(chat_id_str, "phone confirmed")
+    elif payload == CONFIRM_PHONE_CALLBACK:
+        log_user_event(chat_id_str, "phone_confirmed")
         # Получаем текущие данные с телефоном
         current_state = user_states.get(chat_id_str, {})
         user_data = current_state.get('data', {})
 
         # ВАЖНО: Проверяем, что телефон действительно есть в данных
         if 'phone' not in user_data:
-            log_error("Phone missing in data on confirmation", f"User {chat_id_str}")
+            log_data_event(chat_id_str, "phone_missing_on_confirmation")
             await event.bot.send_message(
                 chat_id=chat_id,
                 text="❌ Ошибка: номер телефона не найден. Начинаем регистрацию заново."
@@ -428,44 +524,39 @@ async def message_callback(event: MessageCallback):
             await start_registration_process(event.bot, chat_id)
             return
 
-        log_user_event(chat_id_str, "phone confirmed, moving to FIO", f"Phone: {user_data.get('phone')}")
         await start_fio_request(event.bot, chat_id, user_data)
 
     # Обработка отклонения телефона
-    elif event.callback.payload == REJECT_PHONE_CALLBACK:
-        log_user_event(chat_id_str, "phone rejected")
+    elif payload == REJECT_PHONE_CALLBACK:
+        log_user_event(chat_id_str, "phone_rejected")
         await handle_incorrect_phone(event.bot, chat_id)
 
     # Обработка кнопок исправления данных
-    elif event.callback.payload == CORRECT_FIO_CALLBACK:
+    elif payload == CORRECT_FIO_CALLBACK:
         # Сохраняем уже введенные данные кроме ФИО
         current_data = user_states.get(chat_id_str, {}).get('data', {})
         current_data.pop('fio', None)  # Удаляем старое ФИО
-        log_user_event(chat_id_str, "FIO correction requested", f"Phone in data: {current_data.get('phone')}")
+        log_user_event(chat_id_str, "fio_correction_requested")
         await request_fio_correction(event.bot, chat_id, current_data)
 
-    elif event.callback.payload == CORRECT_BIRTH_DATE_CALLBACK:
+    elif payload == CORRECT_BIRTH_DATE_CALLBACK:
         # Сохраняем уже введенные данные кроме даты рождения
         current_data = user_states.get(chat_id_str, {}).get('data', {})
         current_data.pop('birth_date', None)  # Удаляем старую дату
-        log_user_event(chat_id_str, "birth date correction requested", f"Phone in data: {current_data.get('phone')}")
+        log_user_event(chat_id_str, "birth_date_correction_requested")
         await request_birth_date_correction(event.bot, chat_id, current_data)
 
-    elif event.callback.payload == CONFIRM_DATA_CALLBACK:
-        log_user_event(chat_id_str, "data confirmation requested")
+    elif payload == CONFIRM_DATA_CALLBACK:
+        log_user_event(chat_id_str, "data_confirmation_requested")
         # Завершаем регистрацию
         user_data = user_states.get(chat_id_str, {}).get('data', {})
-        # Детальная проверка данных
-        log_user_event(chat_id_str, "DEBUG confirmation check", f"Data keys: {list(user_data.keys())}")
-        log_user_event(chat_id_str, "DEBUG confirmation check",
-                       f"FIO: {user_data.get('fio')}, Birth: {user_data.get('birth_date')}, Phone: {user_data.get('phone')}")
 
         if user_data and all(key in user_data for key in ['fio', 'birth_date', 'phone']):
             await complete_registration(event.bot, chat_id, user_data)
         else:
             # Если данных недостаточно, начинаем заново
             missing_fields = [key for key in ['fio', 'birth_date', 'phone'] if key not in user_data]
-            log_error("Incomplete data on confirmation", f"User {chat_id_str}, missing: {missing_fields}")
+            log_data_event(chat_id_str, "incomplete_data_on_confirmation", missing=missing_fields)
             await event.bot.send_message(
                 chat_id=chat_id,
                 text="❌ Не все данные заполнены. Начинаем регистрацию заново."
@@ -503,9 +594,12 @@ async def handle_message(event: MessageCreated):
     if not message_text:
         return
 
+    # Логирование ВСЕХ сообщений от пользователя
+    log_user_event(chat_id_str, "message_sent", text=message_text)
+
     # Если пользователь не зарегистрирован и не в процессе регистрации, игнорируем
     if not db.is_user_registered(chat_id_str) and chat_id_str not in user_states:
-        log_user_event(chat_id_str, "message from unregistered user ignored")
+        log_user_event(chat_id_str, "message_ignored_unregistered")
         return
 
     # Проверяем состояние пользователя (процесс регистрации)
@@ -529,7 +623,7 @@ async def handle_message(event: MessageCreated):
     if state == 'waiting_fio':
 
         if not db.validate_fio(message_text):
-            log_user_event(chat_id_str, "invalid FIO format", f"Input: {message_text}")
+            log_user_event(chat_id_str, "invalid_fio_format", input=message_text)
             await event.message.answer(
                 "❌ Ошибка формата!\n\n"
                 "Пожалуйста, введите ваше ФИО в таком формате: Фамилия Имя Отчество\n\n"
@@ -539,7 +633,7 @@ async def handle_message(event: MessageCreated):
 
         # Сохраняем ФИО
         user_data['fio'] = message_text
-        log_user_event(chat_id_str, "FIO entered", f"FIO: {message_text}, Phone in data: {user_data.get('phone')}")
+        log_data_event(chat_id_str, "fio_entered", fio=message_text)
 
         # Переходим к вводу даты рождения
         await request_birth_date(event.bot, chat_id, user_data)
@@ -548,7 +642,7 @@ async def handle_message(event: MessageCreated):
     elif state == 'waiting_birth_date':
 
         if not db.validate_birth_date(message_text):
-            log_user_event(chat_id_str, "invalid birth date format", f"Input: {message_text}")
+            log_user_event(chat_id_str, "invalid_birth_date_format", input=message_text)
             await event.message.answer(
                 "❌ Ошибка формата!\n\n"
                 "Пожалуйста, введите дату рождения в формате: ДД.ММ.ГГГГ\n\n"
@@ -558,8 +652,7 @@ async def handle_message(event: MessageCreated):
 
         # Сохраняем дату рождения
         user_data['birth_date'] = message_text
-        log_user_event(chat_id_str, "birth date entered",
-                       f"Date: {message_text}, Phone in data: {user_data.get('phone')}")
+        log_data_event(chat_id_str, "birth_date_entered", birth_date=message_text)
 
         # Все данные собраны - переходим к подтверждению
         user_states[chat_id_str] = {
@@ -568,9 +661,55 @@ async def handle_message(event: MessageCreated):
         }
         await send_confirmation_message(event.bot, chat_id, user_data)
 
+    # --- Исправление ФИО ---
+    elif state == 'waiting_fio_correction':
+
+        if not db.validate_fio(message_text):
+            log_user_event(chat_id_str, "invalid_fio_format_correction", input=message_text)
+            await event.message.answer(
+                "❌ Ошибка формата!\n\n"
+                "Пожалуйста, введите ваше ФИО в таком формате: Фамилия Имя Отчество\n\n"
+                "Пример: Иванов Иван Иванович"
+            )
+            return
+
+        # Сохраняем исправленное ФИО
+        user_data['fio'] = message_text
+        log_data_event(chat_id_str, "fio_corrected", fio=message_text)
+
+        # Возвращаем к подтверждению данных
+        user_states[chat_id_str] = {
+            'state': 'waiting_confirmation',
+            'data': user_data
+        }
+        await send_confirmation_message(event.bot, chat_id, user_data)
+
+    # --- Исправление даты рождения ---
+    elif state == 'waiting_birth_date_correction':
+
+        if not db.validate_birth_date(message_text):
+            log_user_event(chat_id_str, "invalid_birth_date_format_correction", input=message_text)
+            await event.message.answer(
+                "❌ Ошибка формата!\n\n"
+                "Пожалуйста, введите дату рождения в формате: ДД.ММ.ГГГГ\n\n"
+                "Пример: 13.03.2003"
+            )
+            return
+
+        # Сохраняем исправленную дату рождения
+        user_data['birth_date'] = message_text
+        log_data_event(chat_id_str, "birth_date_corrected", birth_date=message_text)
+
+        # Возвращаем к подтверждению данных
+        user_states[chat_id_str] = {
+            'state': 'waiting_confirmation',
+            'data': user_data
+        }
+        await send_confirmation_message(event.bot, chat_id, user_data)
+
 
 async def handle_contact_message(event: MessageCreated):
-    """Обработка сообщений с контактами (встроенная из contact.py)"""
+    """Обработка сообщений с контактами"""
     chat_id = event.message.recipient.chat_id
     chat_id_str = str(chat_id)
 
@@ -601,12 +740,14 @@ async def handle_contact_message(event: MessageCreated):
 
                 # Валидация телефона
                 if not db.validate_phone(clean_phone):
+                    log_user_event(chat_id_str, "invalid_phone_format", phone=clean_phone)
                     await event.bot.send_message(
                         chat_id=chat_id,
                         text="❌ Неверный формат номера телефона."
                     )
                     return
             else:
+                log_user_event(chat_id_str, "phone_extraction_failed")
                 await event.bot.send_message(
                     chat_id=chat_id,
                     text="❌ Не удалось определить номер телефона."
@@ -619,13 +760,13 @@ async def handle_contact_message(event: MessageCreated):
             # Обновляем состояние с сохраненным телефоном
             user_states[chat_id_str] = {'state': 'waiting_phone_confirmation', 'data': user_data}
 
-            log_user_event(chat_id_str, "phone extracted from contact", f"Phone: {clean_phone}")
+            log_data_event(chat_id_str, "phone_extracted", phone=clean_phone)
 
             # Отправляем подтверждение номера
             await send_phone_confirmation(event.bot, chat_id, clean_phone)
 
         except Exception as e:
-            log_error("Error processing contact", f"User {chat_id_str}: {str(e)}")
+            log_system_event("contact_handler", "processing_failed", error=str(e), chat_id=chat_id_str)
             await event.bot.send_message(
                 chat_id=chat_id,
                 text="❌ Произошла ошибка при обработке контакта."
@@ -634,29 +775,15 @@ async def handle_contact_message(event: MessageCreated):
 
 # --- Запуск вебхука ---
 
-async def setup_webhook():
-    """Настраивает вебхук через Xtunnel"""
-    log_bot_event("Setting up webhook", f"URL: {X_TUNNEL_URL}")
-    await bot.subscribe_webhook(
-        url=X_TUNNEL_URL,
-        update_types=[
-            "message_created",
-            "message_callback",
-            "bot_started"
-        ]
-    )
-    log_bot_event("Webhook setup complete")
-
-
 async def main():
     # Логирование запуска бота
-    log_bot_event("Bot starting")
+    log_system_event("bot", "starting")
 
-    # Сначала настраиваем вебхук
+    # Сначала настраиваем вебхук (включая очистку старых)
     await setup_webhook()
 
     # Затем запускаем сервер
-    log_bot_event("Starting webhook server")
+    log_system_event("bot", "webhook_server_starting")
     await dp.handle_webhook(
         bot=bot,
         host='0.0.0.0',
@@ -664,12 +791,11 @@ async def main():
         log_level='info'
     )
 
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log_bot_event("Bot stopped manually")
+        log_system_event("bot", "stopped_manually")
     except Exception as e:
-        log_error("Bot crashed", f"Error: {str(e)}")
+        log_system_event("bot", "crashed", error=str(e))
         raise
